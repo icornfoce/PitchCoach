@@ -3,15 +3,26 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Networking;
 
 // Azure Cognitive Services Speech SDK (DLLs live under Assets/SpeechSDK).
-// Wrapped in a try/catch + simulation toggle so the project still runs in the
-// editor without valid credentials.
+// Only loaded when SttEngine.AzureStreaming is selected (needs Azure.Core.dll).
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 
 namespace PresentationCoach
 {
+    /// <summary>How spoken words are turned into text for scoring.</summary>
+    public enum SttEngine
+    {
+        /// <summary>Offline fake words/fillers (no key, editor/dev).</summary>
+        Simulated,
+        /// <summary>Record the whole session, transcribe once at Stop via OpenAI Whisper (reuses the OpenAI key).</summary>
+        OpenAIWhisper,
+        /// <summary>Live continuous Azure recognition (requires Azure.Core.dll alongside the Speech SDK).</summary>
+        AzureStreaming
+    }
+
     /// <summary>
     /// Owns everything ear-related:
     ///   1) Native DSP — captures the mic with Unity's <see cref="Microphone"/> and
@@ -36,13 +47,24 @@ namespace PresentationCoach
                  "Route its Output to a SILENT AudioMixerGroup to avoid speaker feedback.")]
         [SerializeField] private AudioSource monitorSource;
 
-        [Header("Azure Speech")]
+        [Header("Speech-to-Text engine")]
+        [Tooltip("OpenAIWhisper = transcribe the whole session at Stop (reuses your OpenAI key). " +
+                 "Simulated = offline fake words. AzureStreaming = live Azure (needs Azure.Core.dll).")]
+        [SerializeField] private SttEngine sttEngine = SttEngine.OpenAIWhisper;
+
+        [Header("OpenAI Whisper")]
+        [Tooltip("Same OpenAI key you use for the LLM advisor.")]
+        [SerializeField] private string openAiApiKey = "<OPENAI_API_KEY>";
+        [SerializeField] private string whisperEndpoint = "https://api.openai.com/v1/audio/transcriptions";
+        [SerializeField] private string whisperModel = "whisper-1";
+        [Tooltip("Safety cap on recorded seconds sent to Whisper (API limit is 25MB ≈ 13 min @16kHz).")]
+        [SerializeField] private int maxRecordSeconds = 480;
+
+        [Header("Azure Speech (optional; needs Azure.Core.dll)")]
         [SerializeField] private string azureKey = "<AZURE_SPEECH_KEY>";
         [SerializeField] private string azureRegion = "southeastasia";
-        [Tooltip("Recognition language. th-TH for Thai filler detection.")]
+        [Tooltip("Azure recognition language; first 2 letters also used as the Whisper language hint.")]
         [SerializeField] private string recognitionLanguage = "th-TH";
-        [Tooltip("If true, skip Azure and emit fake words/fillers (editor/offline dev).")]
-        [SerializeField] private bool useSimulatedStt = false;
 
         [Header("Filler words")]
         [Tooltip("Tokens counted as fillers. Defaults to common Thai hesitation sounds.")]
@@ -73,6 +95,10 @@ namespace PresentationCoach
         private bool _capturing;
         private bool _monitorStarted;
 
+        // Whisper: full-session PCM accumulated from the mic ring buffer.
+        private List<float> _sessionSamples;
+        private int _maxSamples;
+
         // Azure objects (null in simulation mode).
         private SpeechRecognizer _recognizer;
         private PushAudioInputStream _pushStream;
@@ -101,7 +127,7 @@ namespace PresentationCoach
             StartMicrophone();
             _capturing = true;
 
-            if (!useSimulatedStt)
+            if (sttEngine == SttEngine.AzureStreaming)
                 await StartAzureAsync();
         }
 
@@ -110,7 +136,7 @@ namespace PresentationCoach
         {
             _capturing = false;
 
-            if (_recognizer != null)
+            if (sttEngine == SttEngine.AzureStreaming && _recognizer != null)
             {
                 try { await _recognizer.StopContinuousRecognitionAsync(); }
                 catch (Exception e) { Debug.LogWarning($"[Audio] Azure stop failed: {e.Message}"); }
@@ -118,8 +144,16 @@ namespace PresentationCoach
                 _pushStream?.Close(); _pushStream?.Dispose(); _pushStream = null;
             }
 
+            // Grab the final audio fragment before closing the mic.
+            if (sttEngine == SttEngine.OpenAIWhisper) AppendSessionAudio();
+
             if (_micDevice != null && Microphone.IsRecording(_micDevice))
                 Microphone.End(_micDevice);
+
+            // Whisper transcribes the whole session in one request (awaited so
+            // TotalWords/FillerCount are ready before PresentationManager reads them).
+            if (sttEngine == SttEngine.OpenAIWhisper)
+                await TranscribeWithWhisperAsync();
         }
 
         private void ResetAggregates()
@@ -128,6 +162,10 @@ namespace PresentationCoach
             _volumeDbSum = _pitchHzSum = 0f;
             _volumeSampleCount = _pitchSampleCount = 0;
             _lastMicPosition = 0;
+
+            if (_sessionSamples == null) _sessionSamples = new List<float>();
+            _sessionSamples.Clear();
+            _maxSamples = Mathf.Max(1, maxRecordSeconds) * sampleRate;
         }
 
         // ============================================================== //
@@ -163,10 +201,14 @@ namespace PresentationCoach
             { monitorSource.Play(); _monitorStarted = true; }
 
             AnalyzeSpectrum();              // volume + pitch every frame
-            if (!useSimulatedStt) PumpAudioToAzure();
-            else SimulateStt();
+            switch (sttEngine)
+            {
+                case SttEngine.AzureStreaming: PumpAudioToAzure();   break;  // stream to Azure
+                case SttEngine.OpenAIWhisper:  AppendSessionAudio(); break;  // buffer for end-of-session upload
+                case SttEngine.Simulated:      SimulateStt();        break;  // fake words
+            }
 
-            FlushRecognitionResults();      // surface Azure worker-thread results
+            FlushRecognitionResults();      // surface Azure/simulated worker-thread results
         }
 
         /// <summary>
@@ -267,7 +309,7 @@ namespace PresentationCoach
             catch (Exception e)
             {
                 Debug.LogError($"[Audio] Azure init failed, falling back to simulation: {e.Message}");
-                useSimulatedStt = true;
+                sttEngine = SttEngine.Simulated;
             }
         }
 
@@ -352,6 +394,123 @@ namespace PresentationCoach
                 { total++; idx += filler.Length; }
             }
             return total;
+        }
+
+        // ============================================================== //
+        //  OpenAI Whisper STT (record session -> transcribe at Stop)     //
+        // ============================================================== //
+
+        /// <summary>Appends new mic samples (since last read) into the session buffer.</summary>
+        private void AppendSessionAudio()
+        {
+            if (_micClip == null || _sessionSamples == null) return;
+
+            int pos = Microphone.GetPosition(_micDevice);
+            int count = pos - _lastMicPosition;
+            if (count < 0) count += _micClip.samples;   // ring buffer wrapped
+            if (count <= 0) return;
+
+            // Read in pieces bounded by the end of the ring buffer.
+            while (count > 0 && _sessionSamples.Count < _maxSamples)
+            {
+                int offset = _lastMicPosition % _micClip.samples;
+                int chunk = Mathf.Min(count, _micClip.samples - offset);
+                var buf = new float[chunk];
+                _micClip.GetData(buf, offset);
+                _sessionSamples.AddRange(buf);
+                _lastMicPosition = (offset + chunk) % _micClip.samples;
+                count -= chunk;
+            }
+            // Even if we hit the cap, keep the read cursor moving so we don't re-read.
+            if (count > 0) _lastMicPosition = pos;
+        }
+
+        /// <summary>
+        /// Encodes the captured session to WAV and sends it to OpenAI Whisper, then
+        /// counts words + fillers from the returned transcript.
+        /// </summary>
+        private async Task TranscribeWithWhisperAsync()
+        {
+            if (_sessionSamples == null || _sessionSamples.Count == 0)
+            {
+                Debug.LogWarning("[Audio] No audio captured; skipping Whisper transcription.");
+                return;
+            }
+            if (string.IsNullOrEmpty(openAiApiKey) || openAiApiKey.StartsWith("<"))
+            {
+                Debug.LogWarning("[Audio] OpenAI API key not set; skipping Whisper transcription.");
+                return;
+            }
+
+            byte[] wav = EncodeWav(_sessionSamples, sampleRate);
+            string lang = (recognitionLanguage != null && recognitionLanguage.Length >= 2)
+                ? recognitionLanguage.Substring(0, 2).ToLowerInvariant() : "th";
+
+            var form = new List<IMultipartFormSection>
+            {
+                new MultipartFormFileSection("file", wav, "session.wav", "audio/wav"),
+                new MultipartFormDataSection("model", whisperModel),
+                new MultipartFormDataSection("language", lang),
+                new MultipartFormDataSection("response_format", "json"),
+            };
+
+            using (var req = UnityWebRequest.Post(whisperEndpoint, form))
+            {
+                req.SetRequestHeader("Authorization", "Bearer " + openAiApiKey);
+                await req.SendWebRequest();   // awaitable via the extension in LLMAdvisorAPI
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    Debug.LogWarning($"[Audio] Whisper request failed [{req.responseCode}]: {req.error}\n{req.downloadHandler.text}");
+                    return;
+                }
+
+                var parsed = JsonUtility.FromJson<WhisperResponse>(req.downloadHandler.text);
+                string text = parsed != null ? parsed.text : null;
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    Debug.LogWarning("[Audio] Whisper returned empty text.");
+                    return;
+                }
+
+                TotalWords = CountWords(text);
+                FillerCount = CountFillers(text);
+                OnFinalTranscript?.Invoke(text);
+                OnFillerDetected?.Invoke(FillerCount);
+            }
+        }
+
+        [Serializable] private class WhisperResponse { public string text; }
+
+        /// <summary>Writes mono 16-bit PCM samples as a little-endian WAV (RIFF) byte array.</summary>
+        private static byte[] EncodeWav(List<float> samples, int sampleRate)
+        {
+            int n = samples.Count;
+            using (var ms = new System.IO.MemoryStream(44 + n * 2))
+            using (var w = new System.IO.BinaryWriter(ms))
+            {
+                int byteRate = sampleRate * 2;          // mono * 16-bit
+                w.Write(System.Text.Encoding.ASCII.GetBytes("RIFF"));
+                w.Write(36 + n * 2);                    // chunk size
+                w.Write(System.Text.Encoding.ASCII.GetBytes("WAVE"));
+                w.Write(System.Text.Encoding.ASCII.GetBytes("fmt "));
+                w.Write(16);                            // subchunk1 size (PCM)
+                w.Write((short)1);                      // audio format = PCM
+                w.Write((short)1);                      // channels = mono
+                w.Write(sampleRate);
+                w.Write(byteRate);
+                w.Write((short)2);                      // block align
+                w.Write((short)16);                     // bits per sample
+                w.Write(System.Text.Encoding.ASCII.GetBytes("data"));
+                w.Write(n * 2);                         // data size
+                for (int i = 0; i < n; i++)
+                {
+                    short s = (short)(Mathf.Clamp(samples[i], -1f, 1f) * short.MaxValue);
+                    w.Write(s);
+                }
+                w.Flush();
+                return ms.ToArray();
+            }
         }
 
         // ============================================================== //

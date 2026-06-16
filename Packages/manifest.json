@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "com.coplaydev.unity-mcp": "file:C:/Users/ASUS/Downloads/unity-mcp-beta/unity-mcp-beta/MCPForUnity",
     "com.github.homuler.mediapipe": "file:C:/Users/ASUS/Downloads/com.github.homuler.mediapipe-0.16.3.tgz",
     "com.monitor1394.xcharts": "https://github.com/XCharts-Team/XCharts.git",
     "com.unity.2d.animation": "13.0.2",
