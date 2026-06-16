@@ -1,9 +1,9 @@
 {
   "dependencies": {
     "com.coplaydev.unity-mcp": {
-      "version": "file:C:/Users/ASUS/Downloads/unity-mcp-beta/unity-mcp-beta/MCPForUnity",
+      "version": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main",
       "depth": 0,
-      "source": "local",
+      "source": "git",
       "dependencies": {
         "com.unity.modules.animation": "1.0.0",
         "com.unity.modules.imageconversion": "1.0.0",
@@ -14,10 +14,11 @@
         "com.unity.modules.unitywebrequest": "1.0.0",
         "com.unity.nuget.newtonsoft-json": "3.0.2",
         "com.unity.test-framework": "1.1.31"
-      }
+      },
+      "hash": "85c101f5329ec1b0c6f70cba44614166dd78f53c"
     },
     "com.github.homuler.mediapipe": {
-      "version": "file:C:/Users/ASUS/Downloads/com.github.homuler.mediapipe-0.16.3.tgz",
+      "version": "file:com.github.homuler.mediapipe-0.16.3.tgz",
       "depth": 0,
       "source": "local-tarball",
       "dependencies": {
@@ -30,7 +31,7 @@
       "depth": 0,
       "source": "git",
       "dependencies": {},
-      "hash": "fdcefb48f66d2c67cb4f93046802145f6583e0f4"
+      "hash": "46e8b5bb82868064dfc7d6801c9b731414b1d218"
     },
     "com.unity.2d.animation": {
       "version": "13.0.2",
